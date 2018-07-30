@@ -4,23 +4,23 @@ module Chewy
   class Query
     class Criteria
       include Compose
-      ARRAY_STORAGES = [:queries, :filters, :post_filters, :sort, :fields, :types, :scores]
-      HASH_STORAGES = [:options, :request_options, :facets, :aggregations, :suggest]
+      ARRAY_STORAGES = %i[queries filters post_filters sort fields types scores].freeze
+      HASH_STORAGES = %i[options search_options request_options facets aggregations suggest script_fields].freeze
       STORAGES = ARRAY_STORAGES + HASH_STORAGES
 
-      def initialize options = {}
+      def initialize(options = {})
         @options = options.merge(
           query_mode: Chewy.query_mode,
           filter_mode: Chewy.filter_mode,
-          post_filter_mode: Chewy.filter_mode || Chewy.post_filter_mode
+          post_filter_mode: Chewy.post_filter_mode || Chewy.filter_mode
         )
       end
 
-      def == other
+      def ==(other)
         other.is_a?(self.class) && storages == other.storages
       end
 
-      { ARRAY_STORAGES => '[]', HASH_STORAGES => '{}' }.each do |storages, default|
+      {ARRAY_STORAGES => '[]', HASH_STORAGES => '{}'}.each do |storages, default|
         storages.each do |storage|
           class_eval <<-METHODS, __FILE__, __LINE__ + 1
             def #{storage}
@@ -40,63 +40,71 @@ module Chewy
         !!options[:none]
       end
 
-      def update_options(modifer)
-        options.merge!(modifer)
+      def update_options(modifier)
+        options.merge!(modifier)
       end
 
-      def update_request_options(modifer)
-        request_options.merge!(modifer)
+      def update_request_options(modifier)
+        request_options.merge!(modifier)
       end
 
-      def update_facets(modifer)
-        facets.merge!(modifer)
+      def update_search_options(modifier)
+        search_options.merge!(modifier)
       end
 
-      def update_scores(modifer)
-        @scores = scores + Array.wrap(modifer).reject(&:blank?)
+      def update_facets(modifier)
+        facets.merge!(modifier)
       end
 
-      def update_aggregations(modifer)
-        aggregations.merge!(modifer)
+      def update_scores(modifier)
+        @scores = scores + Array.wrap(modifier).reject(&:blank?)
+      end
+
+      def update_aggregations(modifier)
+        aggregations.merge!(modifier)
       end
 
       def update_suggest(modifier)
         suggest.merge!(modifier)
       end
 
-      [:filters, :queries, :post_filters].each do |storage|
-        class_eval <<-RUBY
-          def update_#{storage}(modifer)
-            @#{storage} = #{storage} + Array.wrap(modifer).reject(&:blank?)
+      def update_script_fields(modifier)
+        script_fields.merge!(modifier)
+      end
+
+      %i[filters queries post_filters].each do |storage|
+        class_eval <<-RUBY, __FILE__, __LINE__ + 1
+          def update_#{storage}(modifier)
+            @#{storage} = #{storage} + Array.wrap(modifier).reject(&:blank?)
           end
         RUBY
       end
 
-      def update_sort(modifer, options = {})
+      def update_sort(modifier, options = {})
         @sort = nil if options[:purge]
-        modifer = Array.wrap(modifer).flatten.map do |element|
+        modifier = Array.wrap(modifier).flatten.map do |element|
           element.is_a?(Hash) ? element.map { |k, v| {k => v} } : element
         end.flatten
-        @sort = sort + modifer
+        @sort = sort + modifier
       end
 
-      %w(fields types).each do |storage|
-        define_method "update_#{storage}" do |modifer, options = {}|
+      %w[fields types].each do |storage|
+        define_method "update_#{storage}" do |modifier, options = {}|
           variable = "@#{storage}"
           instance_variable_set(variable, nil) if options[:purge]
-          modifer = send(storage) | Array.wrap(modifer).flatten.map(&:to_s).reject(&:blank?)
-          instance_variable_set(variable, modifer)
+          modifier = send(storage) | Array.wrap(modifier).flatten.map(&:to_s).reject(&:blank?)
+          instance_variable_set(variable, modifier)
         end
       end
 
-      def merge! other
+      def merge!(other)
         STORAGES.each do |storage|
           send("update_#{storage}", other.send(storage))
         end
         self
       end
 
-      def merge other
+      def merge(other)
         clone.merge!(other)
       end
 
@@ -104,18 +112,19 @@ module Chewy
         body = _filtered_query(_request_query, _request_filter, options.slice(:strategy))
 
         if options[:simple]
-          { body: body.presence || { query: { match_all: {} } } }
+          {body: body.presence || {query: {match_all: {}}}}
         else
-          body.merge!(post_filter: _request_post_filter) if post_filters?
-          body.merge!(facets: facets) if facets?
-          body.merge!(aggregations: aggregations) if aggregations?
-          body.merge!(suggest: suggest) if suggest?
-          body.merge!(sort: sort) if sort?
-          body.merge!(_source: fields) if fields?
+          body[:post_filter] = _request_post_filter if post_filters?
+          body[:facets] = facets if facets?
+          body[:aggregations] = aggregations if aggregations?
+          body[:suggest] = suggest if suggest?
+          body[:sort] = sort if sort?
+          body[:_source] = fields if fields?
+          body[:script_fields] = script_fields if script_fields?
 
           body = _boost_query(body)
 
-          { body: body.merge!(request_options) }
+          {body: body.merge!(_request_options)}.merge!(search_options)
         end
       end
 
@@ -125,28 +134,34 @@ module Chewy
         STORAGES.map { |storage| send(storage) }
       end
 
-      def initialize_clone(other)
+      def initialize_clone(origin)
         STORAGES.each do |storage|
-          value = other.send(storage)
+          value = origin.send(storage)
           instance_variable_set("@#{storage}", value.deep_dup)
         end
       end
 
       def _boost_query(body)
-        scores? or return body
+        return body unless scores?
         query = body.delete :query
         filter = body.delete :filter
         if query && filter
-          query = { filtered: { query: query, filter: filter } }
+          query = {filtered: {query: query, filter: filter}}
           filter = nil
         end
-        score = { }
+        score = {}
         score[:functions] = scores
         score[:boost_mode] = options[:boost_mode] if options[:boost_mode]
         score[:score_mode] = options[:score_mode] if options[:score_mode]
         score[:query] = query if query
         score[:filter] = filter if filter
-        body.tap { |b| b[:query] = { function_score: score } }
+        body.tap { |b| b[:query] = {function_score: score} }
+      end
+
+      def _request_options
+        Hash[request_options.map do |key, value|
+          [key, value.is_a?(Proc) ? value.call : value]
+        end]
       end
 
       def _request_query

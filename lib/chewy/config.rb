@@ -2,96 +2,93 @@ module Chewy
   class Config
     include Singleton
 
-    attr_reader :analyzers, :tokenizers, :filters, :char_filters
-    attr_accessor :configuration,
-      # Just sets up logger to current configuration
-      #
-      #   Chewy.logger = Rails.logger
-      #
-      :logger,
-
-      # Urgent update default value. False by default. Urgent
-      # updates are useful for testing, so don't use it in the
-      # application code. Prefer `Chewy.atomic` block for cumulative
-      # index updates.
-      #
-      :urgent_update,
-
+    attr_accessor :settings, :logger,
       # Default query compilation mode. `:must` by default.
       # See Chewy::Query#query_mode for details
       #
       :query_mode,
-
       # Default filters compilation mode. `:and` by default.
       # See Chewy::Query#filter_mode for details
       #
       :filter_mode,
-
       # Default post_filters compilation mode. `nil` by default.
       # See Chewy::Query#post_filter_mode for details
       #
-      :post_filter_mode
+      :post_filter_mode,
+      # The first strategy in stack. `:base` by default.
+      # If you need to return to the previous chewy behavior -
+      # just set it to `:bypass`
+      #
+      :root_strategy,
+      # Default request strategy middleware, used in e.g
+      # Rails controllers. See Chewy::Railtie::RequestStrategy
+      # for more info.
+      #
+      :request_strategy,
+      # Use after_commit callbacks for RDBMS instead of
+      # after_save and after_destroy. True by default. Useful
+      # in tests with transactional fixtures or transactional
+      # DatabaseCleaner strategy.
+      #
+      :use_after_commit_callbacks,
+      # Where Chewy expects to find index definitions
+      # within a Rails app folder.
+      :indices_path,
+      # Set index refresh_interval setting to -1 before reset and put the original value after.
+      # If setting not present, put back to default 1s
+      # https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-update-settings.html
+      :reset_disable_refresh_interval,
+      # Set number_of_replicas to 0 before reset and put the original value after
+      # https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-update-settings.html
+      :reset_no_replicas,
+      # Refresh or not when import async (sidekiq, resque, activejob)
+      :disable_refresh_async,
+      # Default options for root of Chewy type. Allows to set default options
+      # for type mappings like `_all`.
+      :default_root_options,
+      # Default field type for any field in any Chewy type. Defaults to 'string'.
+      :default_field_type
+
+    attr_reader :transport_logger, :transport_tracer,
+      # Chewy search request DSL base class, used by every index.
+      :search_class
 
     def self.delegated
-      public_instance_methods - self.superclass.public_instance_methods - Singleton.public_instance_methods
-    end
-
-    def self.repository name
-      plural_name = name.to_s.pluralize
-
-      class_eval <<-METHOD, __FILE__, __LINE__ + 1
-        def #{name}(name, options = nil)
-          options ? #{plural_name}[name.to_sym] = options : #{plural_name}[name.to_sym]
-        end
-      METHOD
+      public_instance_methods - superclass.public_instance_methods - Singleton.public_instance_methods
     end
 
     def initialize
-      @configuration = {}
-      @urgent_update = false
+      @settings = {}
       @query_mode = :must
       @filter_mode = :and
-      @analyzers = {}
-      @tokenizers = {}
-      @filters = {}
-      @char_filters = {}
+      @root_strategy = :base
+      @request_strategy = :atomic
+      @use_after_commit_callbacks = true
+      @reset_disable_refresh_interval = false
+      @reset_no_replicas = false
+      @disable_refresh_async = false
+      @indices_path = 'app/chewy'
+      @default_root_options = {}
+      @default_field_type = 'text'.freeze
+      self.search_class = Chewy::Search::Request
     end
 
-    # Analysers repository:
-    #
-    #   Chewy.analyzer :my_analyzer2, {
-    #     type: custom,
-    #     tokenizer: 'my_tokenizer1',
-    #     filter : ['my_token_filter1', 'my_token_filter2']
-    #     char_filter : ['my_html']
-    #   }
-    #   Chewy.analyzer(:my_analyzer2) # => {type: 'custom', tokenizer: ...}
-    #
-    repository :analyzer
+    def transport_logger=(logger)
+      Chewy.client.transport.logger = logger
+      @transport_logger = logger
+    end
 
-    # Tokenizers repository:
-    #
-    #   Chewy.tokenizer :my_tokenizer1, {type: standard, max_token_length: 900}
-    #   Chewy.tokenizer(:my_tokenizer1) # => {type: standard, max_token_length: 900}
-    #
-    repository :tokenizer
+    def transport_tracer=(tracer)
+      Chewy.client.transport.tracer = tracer
+      @transport_tracer = tracer
+    end
 
-    # Token filters repository:
-    #
-    #   Chewy.filter :my_token_filter1, {type: stop, stopwords: [stop1, stop2, stop3, stop4]}
-    #   Chewy.filter(:my_token_filter1) # => {type: stop, stopwords: [stop1, stop2, stop3, stop4]}
-    #
-    repository :filter
-
-    # Char filters repository:
-    #
-    #   Chewy.char_filter :my_html, {type: html_strip, escaped_tags: [xxx, yyy], read_ahead: 1024}
-    #   Chewy.char_filter(:my_html) # => {type: html_strip, escaped_tags: [xxx, yyy], read_ahead: 1024}
-    #
-    repository :char_filter
+    def search_class=(base)
+      @search_class = build_search_class(base)
+    end
 
     # Chewy core configurations. There is two ways to set it up:
-    # use `Chewy.configuration=` method or, for Rails application,
+    # use `Chewy.settings=` method or, for Rails application,
     # create `config/chewy.yml` file. Btw, `config/chewy.yml` supports
     # ERB the same way as ActiveRecord's config.
     #
@@ -116,7 +113,7 @@ module Chewy
     #
     #      :wait_for_status - if this option set - chewy actions such
     #      as creating or deleting index, importing data will wait for
-    #      the status specified. Extremely useful for tests under havy
+    #      the status specified. Extremely useful for tests under heavy
     #      indexes manipulations.
     #
     #        test:
@@ -134,50 +131,36 @@ module Chewy
     #            number_of_replicas: 0
     #
     def configuration
-      options = @configuration.deep_symbolize_keys.merge(yaml_options)
-      options.merge!(logger: logger) if logger
-      options
-    end
-
-    def client
-      Thread.current[:chewy_client] ||= ::Elasticsearch::Client.new configuration
-    end
-
-    def atomic?
-      stash.any?
-    end
-
-    def atomic
-      stash.push({})
-      yield
-    ensure
-      stash.pop.each { |type, ids| type.import(ids) }
-    end
-
-    def stash *args
-      if args.any?
-        type, ids = *args
-        raise ArgumentError.new('Only Chewy::Type accepted as the first argument') unless type < Chewy::Type
-        stash.last[type] ||= []
-        stash.last[type] |= ids
-      else
-        Thread.current[:chewy_cache] ||= []
+      yaml_settings.merge(settings.deep_symbolize_keys).tap do |configuration|
+        configuration[:logger] = transport_logger if transport_logger
+        configuration[:indices_path] ||= indices_path if indices_path
+        configuration.merge!(tracer: transport_tracer) if transport_tracer
       end
     end
 
   private
 
-    def yaml_options
-      @yaml_options ||= begin
-        if defined?(Rails)
-          file = Rails.root.join(*%w(config chewy.yml))
+    def yaml_settings
+      @yaml_settings ||= begin
+        if defined?(Rails::VERSION)
+          file = Rails.root.join('config', 'chewy.yml')
 
-          if File.exists?(file)
+          if File.exist?(file)
             yaml = ERB.new(File.read(file)).result
-            hash = YAML.load(yaml)
+            hash = YAML.load(yaml) # rubocop:disable Security/YAMLLoad
             hash[Rails.env].try(:deep_symbolize_keys) if hash
           end
         end || {}
+      end
+    end
+
+    def build_search_class(base)
+      Class.new(base).tap do |search_class|
+        if defined?(::Kaminari)
+          search_class.send :include, Chewy::Search::Pagination::Kaminari
+        elsif defined?(::WillPaginate)
+          search_class.send :include, Chewy::Search::Pagination::WillPaginate
+        end
       end
     end
   end
